@@ -1,0 +1,38 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "student-portfolio-xiazibei-01",
+  "main": "./cloudflare/worker-entry.js",
+  "compatibility_date": "2026-08-28",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "vars": {
+    "AUTH_PLATFORM": "password"
+  },
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "migrations_dir": "./drizzle","database_id": "72fd3af6-6765-49a3-bb89-587b908e4f48","database_name": "student-portfolio-xiazibei-01-db"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "MEDIA_KV","id": "74c74eeecccb4b1d82426c79b4efae35"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05
+    }
+  }
+}
