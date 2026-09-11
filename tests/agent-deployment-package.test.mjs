@@ -3,6 +3,12 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+assert.equal(
+  existsSync("tests/semantic-version.test.mjs"),
+  true,
+  "the focused semantic-version test file must exist before the broader gate runs",
+);
+
 test("ships a machine-readable agent deployment contract", async () => {
   const manifest = JSON.parse(
     await readFile("deployment/agent-manifest.json", "utf8"),
@@ -26,7 +32,11 @@ test("ships a machine-readable agent deployment contract", async () => {
   assert.equal(manifest.authorizationFlow.maximumAutomaticAuthorizationAttempts, 1);
   assert.equal(manifest.authorizationFlow.resumeInterruptedStep, true);
   assert.equal(manifest.authorizationFlow.restartDeploymentAfterAuthorization, false);
-  assert.equal(manifest.trustedReleaseCommand.exactCommand, "/verify-and-tag vX.Y.Z");
+  assert.equal(manifest.trustedReleaseCommand.exactCommand, "/verify-and-tag vX.Y.Z[-PRERELEASE]");
+  assert.equal(
+    manifest.trustedReleaseCommand.pullRequestRequirements.head,
+    "same-repository release/vX.Y.Z[-PRERELEASE]",
+  );
   assert.equal(manifest.trustedReleaseCommand.actor, "repository-owner-only");
   assert.equal(manifest.trustedReleaseCommand.reusableGate, ".github/workflows/release-verify.yml");
   assert.equal(manifest.trustedReleaseCommand.bypassExistingGates, false);
@@ -52,14 +62,16 @@ test("ships a machine-readable agent deployment contract", async () => {
   assert.ok(manifest.liveTests.length >= 10);
 });
 
-test("keeps package, lockfile and template release versions synchronized", async () => {
+test("keeps package and candidate versions synchronized without inventing a release tag", async () => {
   const [packageJson, packageLock, templateVersion] = await Promise.all([
     readFile("package.json", "utf8").then(JSON.parse),
     readFile("package-lock.json", "utf8").then(JSON.parse),
-    readFile("deployment/template-version.json", "utf8").then(JSON.parse),
+    readFile("deployment/local-candidate.json", "utf8").then(JSON.parse),
   ]);
 
-  assert.equal(packageJson.version, "1.3.0");
+  assert.equal(packageJson.version, "1.3.1-b");
+  assert.equal(templateVersion.status, "unreleased");
+  assert.equal(templateVersion.releaseTag, null);
   assert.equal(packageLock.version, packageJson.version);
   assert.equal(packageLock.packages[""].version, packageJson.version);
   assert.equal(templateVersion.version, packageJson.version);
@@ -120,7 +132,10 @@ test("runs the complete production-safe gate for every main pull request", async
 });
 
 test("tags only an explicitly verified release candidate from the protected main workflow", async () => {
-  const workflow = await readFile(".github/workflows/release-verify.yml", "utf8");
+  const workflow = (await readFile(
+    ".github/workflows/release-verify.yml",
+    "utf8",
+  )).replace(/\r\n/gu, "\n");
   const [verificationJobs, tagJob = ""] = workflow.split(/\n  tag-release:\n/u);
 
   assert.match(workflow, /push:\s*\n\s*branches: \[main\]/u);
@@ -198,7 +213,8 @@ test("lets only the repository owner invoke the unchanged release gate from a re
   assert.match(commandWorkflow, /issue_comment:\s*\n\s*types: \[created\]/u);
   assert.match(commandWorkflow, /github\.actor == github\.repository_owner/u);
   assert.match(commandWorkflow, /Only the repository owner can request a release/u);
-  assert.match(commandWorkflow, /\/verify-and-tag\\ v/u);
+  assert.match(commandWorkflow, /command_prefix="\/verify-and-tag "/u);
+  assert.match(commandWorkflow, /node shared\/semantic-version\.mjs parse/u);
   assert.match(commandWorkflow, /pulls\/\$\{PR_NUMBER\}/u);
   assert.match(commandWorkflow, /git\/ref\/heads\/main/u);
   assert.match(commandWorkflow, /base_ref.*main/su);

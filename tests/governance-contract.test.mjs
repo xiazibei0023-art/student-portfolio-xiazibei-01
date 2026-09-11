@@ -14,6 +14,7 @@ import {
   buildProposalEnvelope,
   buildGovernanceTransition,
   migrateFailedBootstrapAudit,
+  remoteCandidateVerificationMode,
   recoverRole,
   scanGovernanceText,
   validateGovernanceContract,
@@ -23,6 +24,7 @@ import {
   verifyProtectedProposal,
   verifyRecordFiles,
   verifyRemoteCandidate,
+  verifyRemoteCandidateTransition,
 } from "../scripts/governance-state.mjs";
 
 const readText = (path) => readFile(path, "utf8");
@@ -30,6 +32,7 @@ const readJson = async (path) => JSON.parse(await readText(path));
 const contractPath = "governance/role-contract.json";
 const schemaPath = "governance/state-schema.json";
 const digest = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 const recordFiles = {
   plan: "01-plan.md",
   planAudit: "02-plan-audit.md",
@@ -420,6 +423,190 @@ test("verifies Candidate commit, tree, branch, PR and ancestry against GitHub", 
     return { ok: true, status: 200, json: async () => ({ commit: { sha: "f".repeat(40) } }) };
   };
   await assert.rejects(() => verifyRemoteCandidate(state, { token: "fictional", fetchImpl: movedBranch }), /分支 tip 已变化/u);
+});
+
+test("transition-aware remote Candidate verification treats a rejected Candidate as historical only after entering implementation", async () => {
+  const contract = await readJson(contractPath);
+  const previous = bootstrapState();
+  const movedSourcePr = {
+    number: 13,
+    state: "open",
+    draft: false,
+    body: "Implementation entry only\n",
+    head: {
+      sha: "d".repeat(40),
+      ref: previous.candidateContext.branch,
+      repo: { full_name: previous.repository },
+    },
+    base: {
+      sha: "f".repeat(40),
+      ref: "main",
+      repo: { full_name: previous.repository },
+    },
+  };
+  const next = buildGovernanceTransition(previous, {
+    roleNumber: 3,
+    targetStage: "IMPLEMENTING",
+    pullRequest: movedSourcePr,
+    treeSha: "e".repeat(40),
+  }, contract).state;
+
+  assert.equal(remoteCandidateVerificationMode(previous, next, contract), "historical-object");
+  const calls = [];
+  const objectOnlyFetch = async (url) => {
+    calls.push(url);
+    assert.match(url, /\/git\/commits\//u);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        sha: previous.candidateSha,
+        tree: { sha: previous.candidateContext.treeSha },
+      }),
+    };
+  };
+  const evidence = await verifyRemoteCandidateTransition(previous, next, {
+    contract,
+    token: "fictional",
+    fetchImpl: objectOnlyFetch,
+  });
+  assert.equal(evidence.mode, "historical-object");
+  assert.equal(evidence.candidateSha, previous.candidateSha);
+  assert.equal(evidence.treeSha, previous.candidateContext.treeSha);
+  assert.equal(calls.length, 1);
+
+  const implementation = stateAt("IMPLEMENTING", {
+    revision: 20,
+    lastUpdatedBy: { roleNumber: 3, roleName: "超级工作" },
+  });
+  const blocked = buildGovernanceTransition(implementation, {
+    roleNumber: 3,
+    targetStage: "BLOCKED",
+    pullRequest: {
+      ...movedSourcePr,
+      body: "阻断编号：TEST-IMPLEMENTATION-BLOCK\n原因：实现分支已经移动，必须允许角色 3 失败关闭并保留历史 Candidate 证据。\n",
+    },
+    treeSha: "e".repeat(40),
+  }, contract).state;
+  assert.equal(blocked.block.sourceStage, "IMPLEMENTING");
+  assert.equal(remoteCandidateVerificationMode(implementation, blocked, contract), "historical-object");
+
+  const wrongTree = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ sha: previous.candidateSha, tree: { sha: "0".repeat(40) } }),
+  });
+  await assert.rejects(() => verifyRemoteCandidateTransition(previous, next, {
+    contract,
+    token: "fictional",
+    fetchImpl: wrongTree,
+  }), /Candidate tree 不匹配/u);
+});
+
+test("transition-aware remote Candidate verification keeps the complete live gate for a new RC", async () => {
+  const contract = await readJson(contractPath);
+  const previous = bootstrapState({
+    stage: "IMPLEMENTING",
+    revision: 4,
+    lastUpdatedBy: { roleNumber: 3, roleName: "超级工作" },
+  });
+  const candidateSha = "d".repeat(40);
+  const candidateTreeSha = "e".repeat(40);
+  const candidateBaseSha = "f".repeat(40);
+  const pr = {
+    number: 13,
+    state: "open",
+    draft: false,
+    body: "Candidate SHA：`" + candidateSha + "`\n测试：全部通过\n生产环境修改：没有\n",
+    head: {
+      sha: candidateSha,
+      ref: previous.candidateContext.branch,
+      repo: { full_name: previous.repository },
+    },
+    base: {
+      sha: candidateBaseSha,
+      ref: "main",
+      repo: { full_name: previous.repository },
+    },
+  };
+  const next = buildGovernanceTransition(previous, {
+    roleNumber: 3,
+    targetStage: "RC_AUDIT_PENDING",
+    pullRequest: pr,
+    treeSha: candidateTreeSha,
+  }, contract).state;
+
+  assert.equal(remoteCandidateVerificationMode(previous, next, contract), "live");
+  const calls = [];
+  const liveFetch = async (url) => {
+    calls.push(url);
+    let body;
+    if (url.includes("/git/commits/")) body = { sha: candidateSha, tree: { sha: candidateTreeSha } };
+    else if (url.includes("/branches/")) body = { commit: { sha: candidateSha } };
+    else if (url.includes("/pulls/")) body = {
+      state: "open",
+      draft: false,
+      head: { sha: candidateSha, ref: pr.head.ref, repo: { full_name: previous.repository } },
+      base: { sha: candidateBaseSha, ref: "main", repo: { full_name: previous.repository } },
+    };
+    else body = { status: "ahead" };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const evidence = await verifyRemoteCandidateTransition(previous, next, {
+    contract,
+    token: "fictional",
+    fetchImpl: liveFetch,
+  });
+  assert.equal(evidence.mode, "live");
+  assert.equal(evidence.candidateSha, candidateSha);
+  assert.equal(evidence.treeSha, candidateTreeSha);
+  assert.equal(calls.length, 4);
+
+  const liveFetchWith = (mode) => async (url) => {
+    if (mode === "moved-branch" && url.includes("/branches/")) {
+      return { ok: true, status: 200, json: async () => ({ commit: { sha: "0".repeat(40) } }) };
+    }
+    if (mode === "wrong-pr-head" && url.includes("/pulls/")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "open",
+          draft: false,
+          head: { sha: "0".repeat(40), ref: pr.head.ref, repo: { full_name: previous.repository } },
+          base: { sha: candidateBaseSha, ref: "main", repo: { full_name: previous.repository } },
+        }),
+      };
+    }
+    if (mode === "wrong-pr-base" && url.includes("/pulls/")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "open",
+          draft: false,
+          head: { sha: candidateSha, ref: pr.head.ref, repo: { full_name: previous.repository } },
+          base: { sha: "0".repeat(40), ref: "main", repo: { full_name: previous.repository } },
+        }),
+      };
+    }
+    if (mode === "diverged" && url.includes("/compare/")) {
+      return { ok: true, status: 200, json: async () => ({ status: "diverged" }) };
+    }
+    return liveFetch(url);
+  };
+  for (const [mode, message] of [
+    ["moved-branch", /Candidate 分支 tip 已变化/u],
+    ["wrong-pr-head", /Candidate PR head SHA 不匹配/u],
+    ["wrong-pr-base", /Candidate PR 基线不匹配/u],
+    ["diverged", /Candidate 不是冻结基线的后代/u],
+  ]) {
+    await assert.rejects(() => verifyRemoteCandidateTransition(previous, next, {
+      contract,
+      token: "fictional",
+      fetchImpl: liveFetchWith(mode),
+    }), message);
+  }
 });
 
 test("builds a Candidate transition only from an immutable same-repository PR", async () => {
@@ -1073,6 +1260,11 @@ function assertProtectedWriterSurface(workflow, writer, contract) {
   assert.match(workflow, /Write the immutable record through a protected pull request[\s\S]*Write current and version snapshot through a protected pull request/u);
   assert.match(workflow, /pull-requests: write/u);
   assert.match(workflow, /governance-protected-write\.sh/u);
+  assert.equal((workflow.match(/verify-remote-transition "\$next"/gu) ?? []).length, 1);
+  assert.match(workflow, /verify-remote-transition "\$next"[\s\S]*--previous "\$PREVIOUS_PATH"/u);
+  assert.equal((workflow.match(/verify-remote "\$next"/gu) ?? []).length, 1);
+  assert.match(workflow, /Build the exact failed-audit migration[\s\S]*verify-remote "\$next"/u);
+  assert.doesNotMatch(workflow, /candidateSha \/\/ empty[\s\S]{0,200}verify-remote "\$next"/u);
   assert.match(writer, /governance-state-write/u);
   assert.match(writer, /repos\/\$REPOSITORY\/dispatches/u);
   assert.match(writer, /\{event_type:"governance-proposal",client_payload:\{proposal_pr:\$proposal_pr\}\}/u);
@@ -1143,6 +1335,7 @@ test("detects protected writer drift before Candidate creation", async () => {
     [workflow.replace("checks: write", "checks: read"), writer, contract],
     [workflow, writer.replace('event_type:"governance-proposal"', 'event_type:"other"'), contract],
     [workflow.replaceAll("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6"), writer, contract],
+    [workflow.replace("verify-remote-transition", "verify-remote"), writer, contract],
   ];
   for (const mutation of mutations) {
     assert.throws(() => assertProtectedWriterSurface(...mutation), assert.AssertionError);
@@ -1552,6 +1745,8 @@ test("documents protected writes, bootstrap retirement and no-preview activation
   assert.match(readme, /trust-root.*main/su);
   assert.match(readme, /Schema 2.*revision 3.*IMPLEMENTATION_REQUIRED/su);
   assert.match(readme + workflow + agents, /15368/u);
+  assert.match(workflow, /IMPLEMENTING.*历史证据.*commit.*Tree.*分支 tip.*RC_AUDIT_PENDING.*完整远端核验/su);
+  assert.match(workflow, /IMPLEMENTING.*BLOCKED.*失败关闭.*不能授予任何审计或发布资格/su);
   assert.match(agents, /Four-role governance entry/u);
   for (const source of roles) {
     assert.match(source, /受保护/u);
@@ -1576,4 +1771,164 @@ test("keeps all six handoff templates and the governance-only product freeze", a
     ".github/workflows/governance-state.yml",
   ];
   assert.ok(changedPaths.every((path) => !path.startsWith("app/") && !path.startsWith("db/") && !path.startsWith("drizzle/")));
+});
+
+test("publishes the exact Super Hub v1.1 names while keeping four version domains separate", async () => {
+  const [readme, workflow, agents, packageJson, contract, schema] = await Promise.all([
+    readText("governance/README.md"),
+    readText("governance/workflow.md"),
+    readText("AGENTS.md"),
+    readJson("package.json"),
+    readJson(contractPath),
+    readJson(schemaPath),
+  ]);
+  for (const name of ["作品集展示网站", "超级中枢", "生产环境", "中枢进度状态"]) {
+    assert.match(readme, new RegExp(name, "u"));
+    assert.match(agents, new RegExp(name, "u"));
+  }
+  assert.match(readme, /Active Student Production Baseline = 作品集展示网站 v1\.3\.0/u);
+  assert.match(readme, /超级中枢 v1\.1/u);
+  assert.match(readme, /`governance-1`、`governance-state`/u);
+  assert.match(readme, /`schemaVersion: 2`/u);
+  assert.match(workflow, /默认人工审核模式.*不得根据旧 `activeVersion`.*授予实施或发布资格/su);
+  assert.equal(packageJson.version, (await readJson("deployment/local-candidate.json")).version);
+  assert.equal(contract.schemaVersion, 2);
+  assert.equal(schema.properties.schemaVersion.const, 2);
+  assert.equal(contract.runtime.stateBranch, "governance-state");
+  assert.equal(contract.bootstrapPolicy.activeVersion, "governance-1");
+});
+
+test("keeps the main machine trust contract while the authorized product candidate evolves", async () => {
+  const frozenSha256 = {
+    "governance/role-contract.json": "79b7592ba03d3c41fa76695ab17f51f8a50d41b5581b0d7667ea152027657650",
+    "governance/state-schema.json": "be53d6339f7915e670d335e9530a41d77f374443cbd92790eec8b5abdb570151",
+    "scripts/governance-state.mjs": "5d362bf36ad676370981a889ba5e92dbe7acaa8ac9df81e97b41b7b6ad6070b4",
+    ".github/workflows/governance-state.yml": "5986ffd8ec63715169553a3372a718f968a96805e66fa4c0ff3e840c1da5a0ae",
+  };
+  for (const [path, expected] of Object.entries(frozenSha256)) {
+    assert.equal(digest((await readText(path)).replaceAll("\r\n", "\n")), expected, path + " drifted from the implementation Base");
+  }
+
+  // Product trees are authorized to change by PLAN-20260906-CF-DUAL-PUBLISH-001.
+});
+
+test("requires every role and handoff template to expose the unified milestone reply", async () => {
+  const fields = [
+    "当前角色：",
+    "当前状态：",
+    "标准主路径：",
+    "当前所在位置：",
+    "当前预计路径：",
+    "最低剩余主步骤：",
+    "下一步：",
+    "下一角色：",
+    "推荐思考程度：",
+    "原因：",
+  ];
+  const rolePaths = ["super-planning.md", "super-audit.md", "super-work.md", "super-release.md"]
+    .map((file) => "governance/roles/" + file);
+  const handoffPaths = [
+    "plan-handoff.md",
+    "audit-report.md",
+    "release-candidate.md",
+    "release-receipt.md",
+    "blocked-report.md",
+    "progress-report.md",
+  ].map((file) => "governance/handoff/" + file);
+  for (const path of [...rolePaths, ...handoffPaths]) {
+    const source = await readText(path);
+    for (const field of fields) assert.match(source, new RegExp(field, "u"), path + " is missing " + field);
+  }
+  const audit = await readText("governance/roles/super-audit.md");
+  assert.match(audit, /2（方案审计）/u);
+  assert.match(audit, /2（Candidate 审计）/u);
+  assert.doesNotMatch(audit, /当前角色：\s*2\s*$/mu);
+});
+
+test("defines one dynamic path table with bounded remaining-step and next-role rules", async () => {
+  const workflow = (await readText("governance/workflow.md")).replaceAll("\r\n", "\n");
+  assert.equal((workflow.match(/^## 动态路径规则$/gmu) ?? []).length, 1);
+  for (const scenario of [
+    "正常产品发布",
+    "规划返工",
+    "实现返工",
+    "BLOCKED",
+    "回滚",
+    "不需要生产发布的治理或文档任务",
+    "已经结束的流程",
+  ]) assert.match(workflow, new RegExp("\\| " + escapeRegExp(scenario) + " \\|", "u"));
+
+  const governanceSection = /### 不需要生产发布的治理或文档任务\n([\s\S]*?)\n### 最低剩余主步骤/u.exec(workflow)?.[1];
+  assert.ok(governanceSection);
+  const completePath = /完整路径为：\n\n([\s\S]*?)\n\n3 完成实施/u.exec(governanceSection)?.[1];
+  const candidatePath = /当前预计路径为：\n\n([\s\S]*?)\n\nCandidate 审计通过/u.exec(governanceSection)?.[1];
+  for (const path of [completePath, candidatePath]) {
+    assert.ok(path);
+    assert.doesNotMatch(path, /4（超级发布）|Cloudflare|Worker|生产部署/u);
+  }
+  assert.match(completePath, /2（方案审计）[\s\S]*3（实施）[\s\S]*2（Candidate 审计）[\s\S]*合入准确治理 Candidate/u);
+  assert.match(candidatePath, /2（Candidate 审计）[\s\S]*合入准确治理 Candidate/u);
+  assert.match(workflow, /最低剩余主步骤为 3/u);
+  assert.match(workflow, /Candidate 已冻结并等待审计时为 2/u);
+  assert.match(workflow, /流程完成时为 0/u);
+  assert.match(workflow, /待阻断解除后重新计算/u);
+  for (const route of [
+    "规划待审计 | 2（方案审计）",
+    "方案不通过 | 1（超级规划）",
+    "方案通过 | 3（超级工作）",
+    "实现完成 | 2（Candidate 审计）",
+    "Candidate 不通过 | 3（超级工作）",
+    "产品 Candidate 通过且需要生产发布 | 4（超级发布）",
+    "纯治理或文档 Candidate 通过 | 3（超级工作），仅合入准确获批 Candidate",
+    "回滚后的实现修复 | 3（超级工作）",
+    "流程完成 | 无（流程结束）",
+  ]) assert.match(workflow, new RegExp(escapeRegExp(route), "u"));
+  assert.match(workflow, /待阻断解除后确认/u);
+});
+
+test("requires a self-contained handoff with Writing Block fallback and bounded risk display", async () => {
+  const [workflow, auditTemplate, ...handoffs] = await Promise.all([
+    readText("governance/workflow.md"),
+    readText("governance/handoff/audit-report.md"),
+    ...["plan-handoff.md", "release-candidate.md", "release-receipt.md", "blocked-report.md", "progress-report.md"]
+      .map((file) => readText("governance/handoff/" + file)),
+  ]);
+  assert.match(workflow, /自包含/u);
+  assert.match(workflow, /Writing Block \/ 写作块.*独立代码块/su);
+  assert.match(workflow, /不得依赖“见上文”/u);
+  assert.match(workflow, /密码、Token、Cookie、恢复码、Secret、二维码访问链接、私人信息或生产资源原始 ID/u);
+  for (const handoff of [auditTemplate, ...handoffs]) {
+    assert.match(handoff, /## 一键复制交接词/u);
+    assert.match(handoff, /Writing Block \/ 写作块.*独立代码块/su);
+  }
+  for (const field of ["阻断风险：", "已接受风险：", "已知问题：", "是否阻断："]) {
+    assert.match(auditTemplate, new RegExp(field, "u"));
+  }
+  assert.match(workflow, /只陈述当前已有审计结果/u);
+  assert.match(workflow, /不得由此引入风险数据库、自动风险评分、Known Issue 平台、监控系统、新治理状态或新状态机分支/u);
+});
+
+test("preserves every machine-used handoff field and fixed path", async () => {
+  const contract = await readJson(contractPath);
+  const requiredFields = {
+    "governance/handoff/plan-handoff.md": ["记录 ID：", "规划编号：", "目标状态：PLAN_AUDIT_PENDING", "下一角色：2（超级审计）"],
+    "governance/handoff/audit-report.md": ["审计编号：", "审计类型：", "最终结论：", "批准 Candidate SHA（候选审计适用）：", "目标状态："],
+    "governance/handoff/release-candidate.md": ["Candidate SHA：", "分支：", "基准提交：", "生产环境修改：没有", "目标状态：RC_AUDIT_PENDING"],
+    "governance/handoff/release-receipt.md": ["已批准 Candidate SHA：", "实际部署 SHA：", "最终状态："],
+    "governance/handoff/blocked-report.md": ["阻断编号：", "阻断阶段：", "需要哪个角色接手："],
+    "governance/handoff/progress-report.md": ["当前阶段：", "仓库状态 revision：", "下一步："],
+  };
+  for (const [path, fields] of Object.entries(requiredFields)) {
+    const source = await readText(path);
+    for (const field of fields) assert.match(source, new RegExp(field, "u"), path + " lost " + field);
+  }
+  assert.deepEqual(contract.roles.map((item) => item.slug), ["super-planning", "super-audit", "super-work", "super-release"]);
+  assert.deepEqual(contract.roles.map((item) => item.handoffTemplate), [
+    "governance/handoff/plan-handoff.md",
+    "governance/handoff/audit-report.md",
+    "governance/handoff/release-candidate.md",
+    "governance/handoff/release-receipt.md",
+  ]);
+  assert.equal(contract.runtime.writeWorkflow, ".github/workflows/governance-state.yml");
+  assert.equal(contract.runtime.currentPath, "governance/runtime/current.json");
 });
